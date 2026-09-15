@@ -10,14 +10,20 @@ from zoneinfo import ZoneInfo
 
 import httpx
 from pydantic import BaseModel, Field
+from rich.align import Align
 from rich.console import Console
+from rich.layout import Layout
 from rich.live import Live
+from rich.panel import Panel
 from rich.table import Table
 
 # --- Konfiguration ---
 API_KEY = os.getenv("SWEDAVIA_API_KEY", "")
-BASE_URL = "https://api.swedavia.se/flightinfo/v2"
-AIRPORTS = ["ARN", "GOT", "BMA", "LLA", "MMX"]
+FLIGHT_URL = "https://api.swedavia.se/flightinfo/v2"
+AIRPORT_URL = "https://api.swedavia.se/airportinfo/v2"
+
+# Fallback-flygplatser om AirportInfo inte svarar
+DEFAULT_AIRPORTS = ["ARN", "GOT", "BMA", "LLA", "MMX"]
 
 console = Console()
 tz_stockholm = ZoneInfo("Europe/Stockholm")
@@ -45,6 +51,7 @@ class Flight(BaseModel):
   departureTime: Optional[FlightTime] = None
   arrivalTime: Optional[FlightTime] = None
   locationAndStatus: Optional[LocationAndStatus] = None
+  checkIn: Optional[Dict[str, Any]] = None
 
   arrivalAirportSwedish: Optional[str] = None
   arrivalAirportEnglish: Optional[str] = None
@@ -79,12 +86,34 @@ def extract_city(flight: Flight, mode: str) -> str:
     )
 
 
+def fetch_available_airports() -> List[str]:
+  """Hämtar tillgängliga IATA-koder dynamiskt från AirportInfo v2."""
+  if not API_KEY:
+    return DEFAULT_AIRPORTS
+
+  headers = {
+      "Accept": "application/json",
+      "Ocp-Apim-Subscription-Key": API_KEY,
+  }
+  try:
+    resp = httpx.get(f"{AIRPORT_URL}/airports", headers=headers, timeout=5.0)
+    if resp.status_code == 200:
+      data = resp.json()
+      # Extrahera IATA-koder från listan
+      codes = [a.get("iata") for a in data if isinstance(a, dict) and a.get("iata")]
+      if codes:
+        return sorted(list(set(codes)))
+  except Exception:
+    pass
+  return DEFAULT_AIRPORTS
+
+
 def fetch_flights(airport: str, mode: str) -> Optional[FlightResponse]:
   if not API_KEY:
     return None
 
   today_str = datetime.now(tz_stockholm).strftime("%Y-%m-%d")
-  url = f"{BASE_URL}/{airport}/{mode}/{today_str}"
+  url = f"{FLIGHT_URL}/{airport}/{mode}/{today_str}"
   headers = {
       "Accept": "application/json",
       "Ocp-Apim-Subscription-Key": API_KEY,
@@ -99,13 +128,20 @@ def fetch_flights(airport: str, mode: str) -> Optional[FlightResponse]:
   return None
 
 
-def generate_board(data: FlightResponse, airport: str, mode: str) -> Table:
+def generate_board(
+    data: FlightResponse,
+    airport: str,
+    mode: str,
+    filter_query: str = "",
+) -> Table:
   now_local = datetime.now(tz_stockholm)
   mode_title = "AVGÅNGAR" if mode == "departures" else "ANKOMSTER & BAGAGE"
+  
+  filter_info = f" | [magenta]Filter: '{filter_query}'[/magenta]" if filter_query else ""
   title_text = (
       f"Swedavia FIDS - {airport.upper()} {mode_title} "
-      f"({now_local.strftime('%H:%M:%S')})\n"
-      f"[dim cyan][Tab/M] Växla Läge | [A] Växla Flygplats | [R] Uppdatera | [Q] Avsluta[/dim cyan]"
+      f"({now_local.strftime('%H:%M:%S')}){filter_info}\n"
+      f"[dim cyan][Tab/M] Läge | [A] Flygplats | [R] Uppdatera | [Q] Avsluta[/dim cyan]"
   )
 
   table = Table(
@@ -118,7 +154,7 @@ def generate_board(data: FlightResponse, airport: str, mode: str) -> Table:
   table.add_column("Tid", style="cyan", no_wrap=True)
   table.add_column("Flight", style="bold yellow")
   table.add_column(
-      "Destination" if mode == "departures" else "Från", style="white"
+      "Destination" if mode == "departures" else "Ankommer Från", style="white"
   )
   table.add_column("Flygbolag", style="magenta")
   table.add_column("Term", justify="center", style="dim")
@@ -141,6 +177,12 @@ def generate_board(data: FlightResponse, airport: str, mode: str) -> Table:
     if status_swe == "Borttagen" or status_code in ["DEL"]:
       continue
 
+    # Filtrering baserat på sökning om användaren angett det
+    flight_id_str = (f.flightScheduleNumber or f.flightId or "").upper()
+    dest_str = extract_city(f, mode).upper()
+    if filter_query and (filter_query.upper() not in flight_id_str and filter_query.upper() not in dest_str):
+      continue
+
     time_obj = f.departureTime if mode == "departures" else f.arrivalTime
     if time_obj and time_obj.scheduledUtc:
       try:
@@ -149,7 +191,7 @@ def generate_board(data: FlightResponse, airport: str, mode: str) -> Table:
         )
         dt_local = dt_utc.astimezone(tz_stockholm)
         threshold = 1800 if mode == "arrivals" else 900
-        if (now_local - dt_local).total_seconds() > threshold:
+        if not filter_query and (now_local - dt_local).total_seconds() > threshold:
           continue
       except Exception:
         pass
@@ -225,7 +267,7 @@ def generate_board(data: FlightResponse, airport: str, mode: str) -> Table:
   return table
 
 
-# --- Tangentbordslyssnare (Non-blocking för macOS terminal) ---
+# --- Tangentbordslyssnare för macOS ---
 class KeyReader:
 
   def __init__(self):
@@ -246,24 +288,37 @@ class KeyReader:
     return None
 
 
-# --- Interaktiv Loop ---
+# --- Huvudprogram ---
 def main():
+  import argparse
+
+  parser = argparse.ArgumentParser(description="Swedavia Terminal FIDS")
+  parser.add_argument("--airport", "-a", default="ARN", help="Start-flygplats (IATA)")
+  parser.add_argument("--mode", "-m", choices=["departures", "arrivals"], default="departures")
+  parser.add_argument("--search", "-s", default="", help="Filtrera på flygnummer eller stad")
+  args = parser.parse_args()
+
   if not API_KEY:
-    console.print(
-        "[bold red]Fel:[/bold red] Miljövariabeln SWEDAVIA_API_KEY saknas."
-    )
+    console.print("[bold red]Fel:[/bold red] Miljövariabeln SWEDAVIA_API_KEY saknas.")
     sys.exit(1)
 
-  current_airport_idx = 0
-  current_mode = "departures"
+  # 1. Hämta alla Swedavia-flygplatser dynamiskt via AirportInfo
+  airports = fetch_available_airports()
+  current_airport = args.airport.upper()
+  if current_airport not in airports:
+    airports.insert(0, current_airport)
+
+  current_airport_idx = airports.index(current_airport)
+  current_mode = args.mode
+  filter_query = args.search
   refresh_interval = 30
   last_fetch_time = 0
 
-  airport = AIRPORTS[current_airport_idx]
+  airport = airports[current_airport_idx]
   cached_data = fetch_flights(airport, current_mode)
 
   if not cached_data:
-    console.print("[red]Kunde inte ansluta till Swedavia API.[/red]")
+    console.print(f"[red]Kunde inte hämta flygdata för {airport}.[/red]")
     sys.exit(1)
 
   last_fetch_time = time.time()
@@ -271,7 +326,7 @@ def main():
   with (
       KeyReader() as kr,
       Live(
-          generate_board(cached_data, airport, current_mode),
+          generate_board(cached_data, airport, current_mode, filter_query),
           console=console,
           screen=True,
           refresh_per_second=4,
@@ -285,26 +340,26 @@ def main():
         k = key.lower()
         if k in ["q", "\x03"]:  # 'q' eller Ctrl+C
           break
-        elif k in ["\t", "m"]:  # Tab eller 'm' för att byta läge
-          current_mode = (
-              "arrivals" if current_mode == "departures" else "departures"
-          )
+        elif k in ["\t", "m"]:  # Tab eller 'm' växlar mode
+          current_mode = "arrivals" if current_mode == "departures" else "departures"
           need_refresh = True
-        elif k == "a":  # 'a' för att byta flygplats
-          current_airport_idx = (current_airport_idx + 1) % len(AIRPORTS)
-          airport = AIRPORTS[current_airport_idx]
+        elif k == "a":  # 'a' växlar till nästa flygplats i listan
+          current_airport_idx = (current_airport_idx + 1) % len(airports)
+          airport = airports[current_airport_idx]
           need_refresh = True
-        elif k == "r":  # 'r' manuell refresh
+        elif k == "r":  # 'r' tvingar manuell refresh
+          need_refresh = True
+        elif k == "c":  # 'c' rensar aktivt filter
+          filter_query = ""
           need_refresh = True
 
-      # Automatisk uppdatering var 30:e sekund eller vid tangenttryck
       now = time.time()
       if need_refresh or (now - last_fetch_time >= refresh_interval):
         fresh_data = fetch_flights(airport, current_mode)
         if fresh_data:
           cached_data = fresh_data
         last_fetch_time = now
-        live.update(generate_board(cached_data, airport, current_mode))
+        live.update(generate_board(cached_data, airport, current_mode, filter_query))
 
       time.sleep(0.05)
 
