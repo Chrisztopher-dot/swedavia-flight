@@ -1,7 +1,10 @@
 from datetime import datetime
 import os
+import select
 import sys
+import termios
 import time
+import tty
 from typing import Any, Dict, List, Optional
 from zoneinfo import ZoneInfo
 
@@ -14,6 +17,7 @@ from rich.table import Table
 # --- Konfiguration ---
 API_KEY = os.getenv("SWEDAVIA_API_KEY", "")
 BASE_URL = "https://api.swedavia.se/flightinfo/v2"
+AIRPORTS = ["ARN", "GOT", "BMA", "LLA", "MMX"]
 
 console = Console()
 tz_stockholm = ZoneInfo("Europe/Stockholm")
@@ -42,7 +46,6 @@ class Flight(BaseModel):
   arrivalTime: Optional[FlightTime] = None
   locationAndStatus: Optional[LocationAndStatus] = None
 
-  # Swedavias platta flygplatsnamn i v2-svaret
   arrivalAirportSwedish: Optional[str] = None
   arrivalAirportEnglish: Optional[str] = None
   departureAirportSwedish: Optional[str] = None
@@ -78,10 +81,7 @@ def extract_city(flight: Flight, mode: str) -> str:
 
 def fetch_flights(airport: str, mode: str) -> Optional[FlightResponse]:
   if not API_KEY:
-    console.print(
-        "[bold red]Fel:[/bold red] Miljövariabeln SWEDAVIA_API_KEY saknas."
-    )
-    sys.exit(1)
+    return None
 
   today_str = datetime.now(tz_stockholm).strftime("%Y-%m-%d")
   url = f"{BASE_URL}/{airport}/{mode}/{today_str}"
@@ -104,7 +104,8 @@ def generate_board(data: FlightResponse, airport: str, mode: str) -> Table:
   mode_title = "AVGÅNGAR" if mode == "departures" else "ANKOMSTER & BAGAGE"
   title_text = (
       f"Swedavia FIDS - {airport.upper()} {mode_title} "
-      f"({now_local.strftime('%H:%M:%S')})"
+      f"({now_local.strftime('%H:%M:%S')})\n"
+      f"[dim cyan][Tab/M] Växla Läge | [A] Växla Flygplats | [R] Uppdatera | [Q] Avsluta[/dim cyan]"
   )
 
   table = Table(
@@ -114,11 +115,10 @@ def generate_board(data: FlightResponse, airport: str, mode: str) -> Table:
       expand=True,
   )
 
-  # Kolumnlayout anpassad efter läge
   table.add_column("Tid", style="cyan", no_wrap=True)
   table.add_column("Flight", style="bold yellow")
   table.add_column(
-      "Destination" if mode == "departures" else "Ankommer Från", style="white"
+      "Destination" if mode == "departures" else "Från", style="white"
   )
   table.add_column("Flygbolag", style="magenta")
   table.add_column("Term", justify="center", style="dim")
@@ -148,7 +148,6 @@ def generate_board(data: FlightResponse, airport: str, mode: str) -> Table:
             time_obj.scheduledUtc.replace("Z", "+00:00")
         )
         dt_local = dt_utc.astimezone(tz_stockholm)
-        # Spara flyg upp till 30 min efter schemalagd tid för ankomster
         threshold = 1800 if mode == "arrivals" else 900
         if (now_local - dt_local).total_seconds() > threshold:
           continue
@@ -193,9 +192,12 @@ def generate_board(data: FlightResponse, airport: str, mode: str) -> Table:
       elif "Försenad" in status or "Inställd" in status:
         status_style = "red"
     else:
-      # Ankomst & bagageformatering
       claim_unit = loc.baggageClaimUnit
-      target_col = f"[bold yellow]Band {claim_unit}[/bold yellow]" if claim_unit else "[dim]Inväntas[/dim]"
+      target_col = (
+          f"[bold yellow]Band {claim_unit}[/bold yellow]"
+          if claim_unit
+          else "[dim]Inväntas[/dim]"
+      )
 
       if time_obj and time_obj.actualUtc:
         land_time = format_time(time_obj.actualUtc)
@@ -223,58 +225,88 @@ def generate_board(data: FlightResponse, airport: str, mode: str) -> Table:
   return table
 
 
-# --- Main Loop ---
+# --- Tangentbordslyssnare (Non-blocking för macOS terminal) ---
+class KeyReader:
+
+  def __init__(self):
+    self.fd = sys.stdin.fileno()
+    self.old_settings = termios.tcgetattr(self.fd)
+
+  def __enter__(self):
+    tty.setcbreak(self.fd)
+    return self
+
+  def __exit__(self, type, value, traceback):
+    termios.tcsetattr(self.fd, termios.TCSADRAIN, self.old_settings)
+
+  def read_key(self) -> Optional[str]:
+    r, _, _ = select.select([sys.stdin], [], [], 0.05)
+    if r:
+      return sys.stdin.read(1)
+    return None
+
+
+# --- Interaktiv Loop ---
 def main():
-  import argparse
-
-  parser = argparse.ArgumentParser(
-      description="Swedavia Terminal Flight & Baggage Board"
-  )
-  parser.add_argument(
-      "--airport",
-      "-a",
-      default="ARN",
-      help="IATA-kod (t.ex. ARN, GOT, BMA, LLA)",
-  )
-  parser.add_argument(
-      "--mode",
-      "-m",
-      choices=["departures", "arrivals"],
-      default="departures",
-      help="Visa avgångar eller ankomster & bagage",
-  )
-  parser.add_argument(
-      "--interval",
-      "-i",
-      type=int,
-      default=30,
-      help="Uppdateringsintervall i sekunder (default: 30)",
-  )
-
-  args = parser.parse_args()
-  airport = args.airport.upper()
-
-  initial_data = fetch_flights(airport, args.mode)
-  if not initial_data:
+  if not API_KEY:
     console.print(
-        f"[red]Kunde inte hämta flygdata för {airport} ({args.mode}).[/red]"
+        "[bold red]Fel:[/bold red] Miljövariabeln SWEDAVIA_API_KEY saknas."
     )
     sys.exit(1)
 
-  with Live(
-      generate_board(initial_data, airport, args.mode),
-      console=console,
-      refresh_per_second=1,
-      screen=True,
-  ) as live:
-    try:
-      while True:
-        time.sleep(args.interval)
-        updated_data = fetch_flights(airport, args.mode)
-        if updated_data:
-          live.update(generate_board(updated_data, airport, args.mode))
-    except KeyboardInterrupt:
-      pass
+  current_airport_idx = 0
+  current_mode = "departures"
+  refresh_interval = 30
+  last_fetch_time = 0
+
+  airport = AIRPORTS[current_airport_idx]
+  cached_data = fetch_flights(airport, current_mode)
+
+  if not cached_data:
+    console.print("[red]Kunde inte ansluta till Swedavia API.[/red]")
+    sys.exit(1)
+
+  last_fetch_time = time.time()
+
+  with (
+      KeyReader() as kr,
+      Live(
+          generate_board(cached_data, airport, current_mode),
+          console=console,
+          screen=True,
+          refresh_per_second=4,
+      ) as live,
+  ):
+    while True:
+      key = kr.read_key()
+      need_refresh = False
+
+      if key:
+        k = key.lower()
+        if k in ["q", "\x03"]:  # 'q' eller Ctrl+C
+          break
+        elif k in ["\t", "m"]:  # Tab eller 'm' för att byta läge
+          current_mode = (
+              "arrivals" if current_mode == "departures" else "departures"
+          )
+          need_refresh = True
+        elif k == "a":  # 'a' för att byta flygplats
+          current_airport_idx = (current_airport_idx + 1) % len(AIRPORTS)
+          airport = AIRPORTS[current_airport_idx]
+          need_refresh = True
+        elif k == "r":  # 'r' manuell refresh
+          need_refresh = True
+
+      # Automatisk uppdatering var 30:e sekund eller vid tangenttryck
+      now = time.time()
+      if need_refresh or (now - last_fetch_time >= refresh_interval):
+        fresh_data = fetch_flights(airport, current_mode)
+        if fresh_data:
+          cached_data = fresh_data
+        last_fetch_time = now
+        live.update(generate_board(cached_data, airport, current_mode))
+
+      time.sleep(0.05)
 
 
 if __name__ == "__main__":
