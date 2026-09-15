@@ -1,104 +1,136 @@
-from datetime import datetime, timezone
+from datetime import datetime
 import os
 import sys
-from typing import List, Optional
+import time
+from typing import Any, Dict, List, Optional
 from zoneinfo import ZoneInfo
+
 import httpx
 from pydantic import BaseModel, Field
 from rich.console import Console
+from rich.live import Live
 from rich.table import Table
 
-# =====================================================================
-# Konfiguration & API-nyckel
-# =====================================================================
+# --- Konfiguration ---
 API_KEY = os.getenv("SWEDAVIA_API_KEY", "")
 BASE_URL = "https://api.swedavia.se/flightinfo/v2"
 
-
-# =====================================================================
-# Datamodeller (enligt Swedavia OpenAPI 3.0-specifikationen)
-# =====================================================================
-class AirlineOperator(BaseModel):
-  iata: Optional[str] = None
-  name: Optional[str] = "Okänt flygbolag"
+console = Console()
+tz_stockholm = ZoneInfo("Europe/Stockholm")
 
 
-class DepartureTime(BaseModel):
+# --- Datamodeller ---
+class FlightTime(BaseModel):
   scheduledUtc: Optional[str] = None
   estimatedUtc: Optional[str] = None
   actualUtc: Optional[str] = None
 
 
-class DepartureLocationAndStatus(BaseModel):
-  terminal: Optional[str] = "-"
-  gate: Optional[str] = "-"
-  gateAction: Optional[str] = None
-  gateActionSwedish: Optional[str] = None
-  flightLegStatus: Optional[str] = "-"
+class LocationAndStatus(BaseModel):
+  flightLegStatus: Optional[str] = None
   flightLegStatusSwedish: Optional[str] = None
+  gate: Optional[str] = None
+  terminal: Optional[str] = None
+  baggageClaimUnit: Optional[str] = None
 
 
-class DepartureFlight(BaseModel):
-  flightId: str
-  arrivalAirportSwedish: Optional[str] = "Okänd destination"
+class Flight(BaseModel):
+  flightId: Optional[str] = None
+  flightScheduleNumber: Optional[str] = None
+  airlineOperator: Optional[Dict[str, Any]] = None
+  departureTime: Optional[FlightTime] = None
+  arrivalTime: Optional[FlightTime] = None
+  locationAndStatus: Optional[LocationAndStatus] = None
+
+  # Swedavias platta flygplatsnamn i v2-svaret
+  arrivalAirportSwedish: Optional[str] = None
   arrivalAirportEnglish: Optional[str] = None
-  airlineOperator: Optional[AirlineOperator] = None
-  departureTime: Optional[DepartureTime] = None
-  locationAndStatus: Optional[DepartureLocationAndStatus] = None
+  departureAirportSwedish: Optional[str] = None
+  departureAirportEnglish: Optional[str] = None
+
+  class Config:
+    extra = "allow"
 
 
-class DeparturesResponse(BaseModel):
-  numberOfFlights: int = 0
-  flights: List[DepartureFlight] = Field(default_factory=list)
+class FlightResponse(BaseModel):
+  flights: List[Flight] = Field(default_factory=list)
 
 
-# =====================================================================
-# API-anrop
-# =====================================================================
-def fetch_departures(airport_iata: str, date_str: str) -> DeparturesResponse:
-  """Hämtar dagens avgångar för en given flygplats (t.ex.
-
-  ARN, GOT, BMA).
-  """
-  headers = {"Ocp-Apim-Subscription-Key": API_KEY, "Accept": "application/json"}
-  url = f"{BASE_URL}/{airport_iata}/departures/{date_str}"
-
-  with httpx.Client(timeout=10.0) as client:
-    response = client.get(url, headers=headers)
-
-    if response.status_code == 401:
-      print("❌ HTTP 401: Ogiltig eller utgången API-nyckel.")
-      sys.exit(1)
-    elif response.status_code == 204:
-      return DeparturesResponse(numberOfFlights=0, flights=[])
-
-    response.raise_for_status()
-    return DeparturesResponse.model_validate(response.json())
+# --- Hjälpfunktioner ---
+def format_time(utc_iso: Optional[str]) -> str:
+  if not utc_iso:
+    return "--:--"
+  try:
+    dt = datetime.fromisoformat(utc_iso.replace("Z", "+00:00"))
+    return dt.astimezone(tz_stockholm).strftime("%H:%M")
+  except Exception:
+    return "--:--"
 
 
-# =====================================================================
-# Presentation & Filtrering
-# =====================================================================
-def display_board(data: DeparturesResponse, airport: str):
-  console = Console()
-  tz_stockholm = ZoneInfo("Europe/Stockholm")
+def extract_city(flight: Flight, mode: str) -> str:
+  if mode == "departures":
+    return flight.arrivalAirportSwedish or flight.arrivalAirportEnglish or "--"
+  else:
+    return (
+        flight.departureAirportSwedish or flight.departureAirportEnglish or "--"
+    )
+
+
+def fetch_flights(airport: str, mode: str) -> Optional[FlightResponse]:
+  if not API_KEY:
+    console.print(
+        "[bold red]Fel:[/bold red] Miljövariabeln SWEDAVIA_API_KEY saknas."
+    )
+    sys.exit(1)
+
+  today_str = datetime.now(tz_stockholm).strftime("%Y-%m-%d")
+  url = f"{BASE_URL}/{airport}/{mode}/{today_str}"
+  headers = {
+      "Accept": "application/json",
+      "Ocp-Apim-Subscription-Key": API_KEY,
+  }
+
+  try:
+    resp = httpx.get(url, headers=headers, timeout=8.0)
+    if resp.status_code == 200:
+      return FlightResponse.model_validate(resp.json())
+  except Exception:
+    pass
+  return None
+
+
+def generate_board(data: FlightResponse, airport: str, mode: str) -> Table:
   now_local = datetime.now(tz_stockholm)
-
-  table = Table(
-      title=f"✈️  Avgångar från {airport} ({now_local.strftime('%Y-%m-%d %H:%M')})",
-      header_style="bold blue",
+  mode_title = "AVGÅNGAR" if mode == "departures" else "ANKOMSTER & BAGAGE"
+  title_text = (
+      f"Swedavia FIDS - {airport.upper()} {mode_title} "
+      f"({now_local.strftime('%H:%M:%S')})"
   )
 
+  table = Table(
+      title=title_text,
+      show_header=True,
+      header_style="bold cyan",
+      expand=True,
+  )
+
+  # Kolumnlayout anpassad efter läge
   table.add_column("Tid", style="cyan", no_wrap=True)
   table.add_column("Flight", style="bold yellow")
-  table.add_column("Destination", style="white")
+  table.add_column(
+      "Destination" if mode == "departures" else "Ankommer Från", style="white"
+  )
   table.add_column("Flygbolag", style="magenta")
   table.add_column("Term", justify="center", style="dim")
-  table.add_column("Gate", justify="center", style="green")
-  table.add_column("Status / Händelse", style="bold")
 
-  # 1. Filtrera bort inställda samt redan passerade flyg (>15 min sedan)
-  valid_flights: List[DepartureFlight] = []
+  if mode == "departures":
+    table.add_column("Gate", justify="center", style="bold green")
+    table.add_column("Status / Avgång", style="bold")
+  else:
+    table.add_column("Bagageband", justify="center", style="bold yellow")
+    table.add_column("Status / Landning", style="bold")
+
+  valid_flights: List[Flight] = []
   for f in data.flights:
     if not f.locationAndStatus:
       continue
@@ -106,95 +138,144 @@ def display_board(data: DeparturesResponse, airport: str):
     status_swe = f.locationAndStatus.flightLegStatusSwedish or ""
     status_code = f.locationAndStatus.flightLegStatus or ""
 
-    # Hoppa över rader som är borttagna eller inställda
-    if status_swe == "Borttagen" or status_code in ["CAN", "DEL"]:
+    if status_swe == "Borttagen" or status_code in ["DEL"]:
       continue
 
-    # Sortera bort flyg som avgick för mer än 15 minuter sedan
-    if f.departureTime and f.departureTime.scheduledUtc:
+    time_obj = f.departureTime if mode == "departures" else f.arrivalTime
+    if time_obj and time_obj.scheduledUtc:
       try:
-        utc_dt = datetime.fromisoformat(
-            f.departureTime.scheduledUtc.replace("Z", "+00:00")
+        dt_utc = datetime.fromisoformat(
+            time_obj.scheduledUtc.replace("Z", "+00:00")
         )
-        local_dt = utc_dt.astimezone(tz_stockholm)
-        if (now_local - local_dt).total_seconds() > 900:  # 900 sek = 15 min
+        dt_local = dt_utc.astimezone(tz_stockholm)
+        # Spara flyg upp till 30 min efter schemalagd tid för ankomster
+        threshold = 1800 if mode == "arrivals" else 900
+        if (now_local - dt_local).total_seconds() > threshold:
           continue
       except Exception:
         pass
 
     valid_flights.append(f)
 
+  def get_sort_time(flight: Flight):
+    t = flight.departureTime if mode == "departures" else flight.arrivalTime
+    return t.scheduledUtc if t and t.scheduledUtc else ""
 
-  # 2. Sortera kronologiskt efter schemalagd tid
-  valid_flights.sort(
-      key=lambda x: (
-          x.departureTime.scheduledUtc
-          if x.departureTime and x.departureTime.scheduledUtc
-          else ""
-      )
-  )
+  valid_flights.sort(key=get_sort_time)
 
-  # 3. Rendera rader
-  count = 0
-  for flight in valid_flights:
-    time_str = "--:--"
-    if flight.departureTime and flight.departureTime.scheduledUtc:
-      try:
-        utc_dt = datetime.fromisoformat(
-            flight.departureTime.scheduledUtc.replace("Z", "+00:00")
-        )
-        local_dt = utc_dt.astimezone(tz_stockholm)
-        time_str = local_dt.strftime("%H:%M")
-      except Exception:
-        time_str = flight.departureTime.scheduledUtc[-9:-4]
+  for f in valid_flights[:25]:
+    time_obj = f.departureTime if mode == "departures" else f.arrivalTime
+    sched_time = format_time(time_obj.scheduledUtc if time_obj else None)
 
-    airline = flight.airlineOperator.name if flight.airlineOperator else "-"
-    term = (
-        flight.locationAndStatus.terminal if flight.locationAndStatus else "-"
+    flight_no = f.flightScheduleNumber or f.flightId or "--"
+    airline = (
+        f.airlineOperator.get("name", "--") if f.airlineOperator else "--"
     )
-    gate = flight.locationAndStatus.gate if flight.locationAndStatus else "-"
+    city = extract_city(f, mode)
 
-    # Bestäm statusmeddelande
-    status_text = "I tid"
-    if flight.locationAndStatus:
-      if flight.locationAndStatus.gateActionSwedish:
-        status_text = flight.locationAndStatus.gateActionSwedish
-      elif flight.locationAndStatus.flightLegStatusSwedish:
-        status_text = flight.locationAndStatus.flightLegStatusSwedish
-      elif (
-          flight.locationAndStatus.flightLegStatus
-          and flight.locationAndStatus.flightLegStatus != "-"
-      ):
-        status_text = flight.locationAndStatus.flightLegStatus
+    loc = f.locationAndStatus
+    terminal = loc.terminal or "-"
 
-    # Färgmarkering beroende på status
-    status_style = "green" if status_text in ["I tid", "Öppen"] else "yellow"
-    if "Stängd" in status_text or "Försenad" in status_text:
-      status_style = "red"
+    status = loc.flightLegStatusSwedish or loc.flightLegStatus or ""
+    status_style = "white"
+
+    if mode == "departures":
+      target_col = loc.gate or "-"
+      if time_obj and time_obj.estimatedUtc:
+        est_time = format_time(time_obj.estimatedUtc)
+        status = (
+            f"Beräknad {est_time} ({status})"
+            if status
+            else f"Beräknad {est_time}"
+        )
+      if "Boarding" in status or "Gå till gate" in status:
+        status_style = "green"
+      elif "Försenad" in status or "Inställd" in status:
+        status_style = "red"
+    else:
+      # Ankomst & bagageformatering
+      claim_unit = loc.baggageClaimUnit
+      target_col = f"[bold yellow]Band {claim_unit}[/bold yellow]" if claim_unit else "[dim]Inväntas[/dim]"
+
+      if time_obj and time_obj.actualUtc:
+        land_time = format_time(time_obj.actualUtc)
+        status = f"Landat {land_time}"
+        status_style = "green"
+      elif time_obj and time_obj.estimatedUtc:
+        est_time = format_time(time_obj.estimatedUtc)
+        status = f"Förväntas {est_time}"
+        status_style = "cyan"
+      elif "Landat" in status:
+        status_style = "green"
+      elif "Försenad" in status or "Inställd" in status:
+        status_style = "red"
 
     table.add_row(
-        time_str,
-        flight.flightId,
-        flight.arrivalAirportSwedish,
+        sched_time,
+        flight_no,
+        city,
         airline,
-        term,
-        gate,
-        f"[{status_style}]{status_text}[/{status_style}]",
+        terminal,
+        target_col,
+        f"[{status_style}]{status}[/{status_style}]",
     )
-    count += 1
-    if count >= 35:
-      break
 
-  console.print(table)
+  return table
 
 
-# =====================================================================
-# Main entrypoint
-# =====================================================================
+# --- Main Loop ---
+def main():
+  import argparse
+
+  parser = argparse.ArgumentParser(
+      description="Swedavia Terminal Flight & Baggage Board"
+  )
+  parser.add_argument(
+      "--airport",
+      "-a",
+      default="ARN",
+      help="IATA-kod (t.ex. ARN, GOT, BMA, LLA)",
+  )
+  parser.add_argument(
+      "--mode",
+      "-m",
+      choices=["departures", "arrivals"],
+      default="departures",
+      help="Visa avgångar eller ankomster & bagage",
+  )
+  parser.add_argument(
+      "--interval",
+      "-i",
+      type=int,
+      default=30,
+      help="Uppdateringsintervall i sekunder (default: 30)",
+  )
+
+  args = parser.parse_args()
+  airport = args.airport.upper()
+
+  initial_data = fetch_flights(airport, args.mode)
+  if not initial_data:
+    console.print(
+        f"[red]Kunde inte hämta flygdata för {airport} ({args.mode}).[/red]"
+    )
+    sys.exit(1)
+
+  with Live(
+      generate_board(initial_data, airport, args.mode),
+      console=console,
+      refresh_per_second=1,
+      screen=True,
+  ) as live:
+    try:
+      while True:
+        time.sleep(args.interval)
+        updated_data = fetch_flights(airport, args.mode)
+        if updated_data:
+          live.update(generate_board(updated_data, airport, args.mode))
+    except KeyboardInterrupt:
+      pass
+
+
 if __name__ == "__main__":
-  # Stöd för att skicka med IATA-kod som argument: python app.py GOT
-  airport_code = sys.argv[1].upper() if len(sys.argv) > 1 else "ARN"
-  today_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-
-  result = fetch_departures(airport_code, today_utc)
-  display_board(result, airport_code)
+  main()
