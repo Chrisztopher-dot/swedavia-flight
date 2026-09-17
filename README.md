@@ -53,26 +53,39 @@ def get_flight_board(airport, mode, date):
 
 ---
 
-## 🚀 Running the Web FIDS Application
+## ⚡ Quick Launch (1-Click)
+
+### 🍏 macOS / Linux
+Simply double-click **`start.command`** in Finder (or run `./start.command` in terminal).
+
+### 🪟 Windows
+Simply double-click **`start.bat`** in File Explorer.
+*(If running for the very first time on a fresh Windows machine, double-click **`setup_windows.bat`** first to set up the environment).*
+
+---
+
+## 🚀 Manual Running (Terminal)
 
 ### 1. Start the FastAPI Backend
 ```bash
-# In the project root
+# macOS / Linux:
 ./.venv/bin/uvicorn server:app --host 0.0.0.0 --port 8000 --reload
+
+# Windows:
+.venv\Scripts\uvicorn server:app --host 0.0.0.0 --port 8000 --reload
 ```
 API Documentation is available at `http://localhost:8000/docs`.
 
 ### 2. Start the Modern Frontend (Development Mode)
 ```bash
-# In another terminal window
 cd frontend
 npm run dev
 ```
 Open `http://localhost:5173` in your browser.
 
 ### 3. All-in-One Production Mode
-You can also build the frontend and serve it directly from FastAPI at `http://localhost:8000`:
 ```bash
 npm run build --prefix frontend
-./.venv/bin/python3 server.py
+python server.py
 ```
+Open `http://localhost:8000` in your browser.
