@@ -1,22 +1,26 @@
 import React from 'react';
-import { FlightItem, FlightMode } from '../types';
+import { FlightItem, FlightMode, TimeFrame } from '../types';
 import { StatusBadge } from './StatusBadge';
-import { Plane, Luggage, MapPin, Building2, AlertCircle } from 'lucide-react';
+import { Plane, Luggage, MapPin, Building2, AlertCircle, History, Clock } from 'lucide-react';
 
 interface FidsTableProps {
   flights: FlightItem[];
   mode: FlightMode;
+  timeframe: TimeFrame;
   isLoading: boolean;
   searchQuery: string;
   onClearSearch: () => void;
+  onSwitchTimeframe?: (tf: TimeFrame) => void;
 }
 
 export const FidsTable: React.FC<FidsTableProps> = ({
   flights,
   mode,
+  timeframe,
   isLoading,
   searchQuery,
   onClearSearch,
+  onSwitchTimeframe,
 }) => {
   const isDepartures = mode === 'departures';
 
@@ -39,26 +43,73 @@ export const FidsTable: React.FC<FidsTableProps> = ({
         <div className="inline-flex p-4 rounded-full bg-slate-800/80 border border-slate-700/60 mb-4 text-slate-400">
           <AlertCircle className="w-8 h-8 text-amber-400" />
         </div>
-        <h3 className="text-lg font-bold text-white mb-1">No Flights Found</h3>
+        <h3 className="text-lg font-bold text-white mb-1">No Flights in this View</h3>
         <p className="text-sm text-slate-400 max-w-md mx-auto mb-6">
           {searchQuery
-            ? `No flights matching "${searchQuery}" in current schedule.`
+            ? `No flights matching "${searchQuery}" in ${timeframe} schedule.`
+            : timeframe === 'upcoming'
+            ? `No further upcoming ${mode} scheduled for today.`
+            : timeframe === 'past'
+            ? `No earlier ${mode} recorded for today yet.`
             : `No ${mode} currently scheduled for today at this airport.`}
         </p>
-        {searchQuery && (
-          <button
-            onClick={onClearSearch}
-            className="px-4 py-2 rounded-xl bg-cyan-500 hover:bg-cyan-400 text-slate-950 font-bold text-xs uppercase tracking-wider transition-colors shadow-lg"
-          >
-            Clear Search Filter
-          </button>
-        )}
+        <div className="flex items-center justify-center gap-3">
+          {searchQuery && (
+            <button
+              onClick={onClearSearch}
+              className="px-4 py-2 rounded-xl bg-cyan-500 hover:bg-cyan-400 text-slate-950 font-bold text-xs uppercase tracking-wider transition-colors shadow-lg"
+            >
+              Clear Search Filter
+            </button>
+          )}
+          {timeframe !== 'all' && onSwitchTimeframe && (
+            <button
+              onClick={() => onSwitchTimeframe('all')}
+              className="px-4 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-white font-bold text-xs uppercase tracking-wider transition-colors border border-slate-700"
+            >
+              View Full 24h Schedule
+            </button>
+          )}
+        </div>
       </div>
     );
   }
 
   return (
     <div className="w-full bg-fids-surface/90 border border-fids-border rounded-2xl overflow-hidden backdrop-blur-md shadow-2xl">
+      {/* Informational Sub-header Banner */}
+      <div className="px-4 sm:px-6 py-2.5 bg-slate-950/90 border-b border-fids-border/80 flex flex-wrap items-center justify-between gap-2 text-xs">
+        {timeframe === 'upcoming' ? (
+          <div className="flex items-center gap-2 text-emerald-300 font-semibold">
+            <span className="flex h-2 w-2 relative">
+              <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75"></span>
+              <span className="relative inline-flex rounded-full h-2 w-2 bg-emerald-500"></span>
+            </span>
+            <span className="font-mono uppercase tracking-wider text-[11px]">
+              Live Airport Timetable • Synchronized with Stockholm local time
+            </span>
+          </div>
+        ) : timeframe === 'past' ? (
+          <div className="flex items-center gap-2 text-purple-300 font-semibold">
+            <History className="w-3.5 h-3.5 text-purple-400" />
+            <span className="font-mono uppercase tracking-wider text-[11px]">
+              Earlier Movements Archive • Completed flights & baggage today
+            </span>
+          </div>
+        ) : (
+          <div className="flex items-center gap-2 text-cyan-300 font-semibold">
+            <Clock className="w-3.5 h-3.5 text-cyan-400" />
+            <span className="font-mono uppercase tracking-wider text-[11px]">
+              Full 24-Hour Schedule Overview (Past & Upcoming)
+            </span>
+          </div>
+        )}
+
+        <div className="text-slate-400 font-mono text-[11px]">
+          {flights.length} {flights.length === 1 ? 'flight' : 'flights'} listed
+        </div>
+      </div>
+
       {/* Table Container with Horizontal Scroll */}
       <div className="overflow-x-auto">
         <table className="w-full text-left border-collapse min-w-[760px]">
@@ -111,17 +162,29 @@ export const FidsTable: React.FC<FidsTableProps> = ({
           <tbody className="divide-y divide-slate-800/50 text-sm">
             {flights.map((item, idx) => {
               const isEven = idx % 2 === 0;
+              const isPastItem = item.is_past;
 
               return (
                 <tr
                   key={`${item.flight}-${item.time}-${idx}`}
                   className={`group transition-colors duration-150 ${
-                    isEven ? 'bg-slate-900/30' : 'bg-slate-950/20'
+                    isPastItem && timeframe === 'all'
+                      ? 'opacity-60 bg-slate-950/40 hover:opacity-100'
+                      : isEven
+                      ? 'bg-slate-900/30'
+                      : 'bg-slate-950/20'
                   } hover:bg-slate-800/50`}
                 >
                   {/* Scheduled Time */}
                   <td className="py-3.5 px-4 sm:px-6 font-mono text-base font-bold text-amber-400 whitespace-nowrap fids-glow-amber">
-                    {item.time}
+                    <div className="flex items-center gap-1.5">
+                      <span>{item.time}</span>
+                      {isPastItem && timeframe === 'all' && (
+                        <span className="text-[9px] font-sans uppercase px-1 py-0.2 rounded bg-slate-800 text-slate-400">
+                          Past
+                        </span>
+                      )}
+                    </div>
                   </td>
 
                   {/* Flight Number */}
@@ -202,18 +265,18 @@ export const FidsTable: React.FC<FidsTableProps> = ({
       <div className="border-t border-fids-border bg-slate-950/80 px-4 sm:px-6 py-3 flex flex-wrap items-center justify-between gap-3 text-xs text-slate-400">
         <div className="flex items-center gap-4">
           <span>
-            Showing <strong className="text-white font-mono">{flights.length}</strong> scheduled{' '}
+            Showing <strong className="text-white font-mono">{flights.length}</strong> {timeframe}{' '}
             {isDepartures ? 'departures' : 'arrivals'}
           </span>
         </div>
         <div className="flex items-center gap-3 text-[11px] font-mono">
           <span className="flex items-center gap-1.5">
             <span className="w-2 h-2 rounded-full bg-emerald-400"></span>
-            Active
+            Active / Boarding
           </span>
           <span className="flex items-center gap-1.5">
             <span className="w-2 h-2 rounded-full bg-amber-400"></span>
-            Estimated/Delayed
+            Estimated / Delayed
           </span>
           <span className="flex items-center gap-1.5">
             <span className="w-2 h-2 rounded-full bg-rose-400"></span>
@@ -224,4 +287,3 @@ export const FidsTable: React.FC<FidsTableProps> = ({
     </div>
   );
 };
-

@@ -6,9 +6,12 @@ export interface FlightItem {
   terminal: string;
   resource: string;
   status: string;
+  is_past?: boolean;
 }
 
 export type FlightMode = 'departures' | 'arrivals';
+
+export type TimeFrame = 'upcoming' | 'past' | 'all';
 
 export interface AirportOption {
   iata: string;
@@ -16,4 +19,3 @@ export interface AirportOption {
   city: string;
   isHub: boolean;
 }
-

@@ -57,6 +57,7 @@ class FlightItem(BaseModel):
     terminal: str
     resource: str
     status: str
+    is_past: bool = False
 
 
 def format_time_hhmm(utc_iso: Optional[str]) -> Optional[str]:
@@ -212,9 +213,11 @@ def get_airports():
 def get_flights(
     airport: str = Query(default="ARN", description="Airport IATA code (e.g. ARN, GOT, BMA)"),
     mode: str = Query(default="departures", pattern="^(departures|arrivals)$", description="Mode: departures or arrivals"),
+    timeframe: str = Query(default="all", pattern="^(all|upcoming|past)$", description="Timeframe: upcoming, past, or all"),
 ):
     airport_code = airport.upper().strip()
     mode_val = mode.lower().strip()
+    timeframe_val = timeframe.lower().strip()
 
     if not API_KEY:
         raise HTTPException(
@@ -280,7 +283,24 @@ def get_flights(
         resource = extract_resource(f, mode_val)
         status = extract_status(f, mode_val)
 
-        # Sort key helper
+        # Calculate whether the flight already occurred (past) or is now/upcoming
+        is_past = False
+        if sched_iso:
+            try:
+                dt_utc = datetime.fromisoformat(sched_iso.replace("Z", "+00:00"))
+                dt_local = dt_utc.astimezone(TZ_STOCKHOLM)
+                diff_seconds = (now_local - dt_local).total_seconds()
+                # Threshold: 20 minutes after scheduled departure, or 40 minutes after scheduled arrival
+                threshold_seconds = 2400 if mode_val == "arrivals" else 1200
+                if diff_seconds > threshold_seconds:
+                    is_past = True
+                elif mode_val == "departures" and "departed" in status.lower() and diff_seconds > 600:
+                    is_past = True
+                elif mode_val == "arrivals" and "landed" in status.lower() and diff_seconds > 1800:
+                    is_past = True
+            except Exception:
+                is_past = False
+
         result.append(
             FlightItem(
                 time=formatted_time,
@@ -290,11 +310,17 @@ def get_flights(
                 terminal=terminal,
                 resource=resource,
                 status=status,
+                is_past=is_past,
             )
         )
 
     # Sort flights chronologically by time
     result.sort(key=lambda x: x.time if x.time != "--:--" else "99:99")
+
+    if timeframe_val == "upcoming":
+        return [f for f in result if not f.is_past]
+    elif timeframe_val == "past":
+        return [f for f in result if f.is_past]
 
     return result
 

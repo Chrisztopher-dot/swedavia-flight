@@ -1,8 +1,9 @@
 import { useState, useEffect, useMemo, useCallback } from 'react';
-import { FlightItem, FlightMode, AirportOption } from './types';
+import { FlightItem, FlightMode, TimeFrame, AirportOption } from './types';
 import { LiveClock } from './components/Clock';
 import { AirportSelector } from './components/AirportSelector';
 import { ModeSelector } from './components/ModeSelector';
+import { TimelineSelector } from './components/TimelineSelector';
 import { SearchBar } from './components/SearchBar';
 import { AutoRefreshIndicator } from './components/AutoRefreshIndicator';
 import { FidsTable } from './components/FidsTable';
@@ -27,9 +28,10 @@ export function App() {
   const [airports, setAirports] = useState<AirportOption[]>(DEFAULT_AIRPORTS);
   const [selectedAirport, setSelectedAirport] = useState<string>('ARN');
   const [mode, setMode] = useState<FlightMode>('departures');
+  const [timeframe, setTimeframe] = useState<TimeFrame>('upcoming');
   const [searchQuery, setSearchQuery] = useState<string>('');
 
-  const [flights, setFlights] = useState<FlightItem[]>([]);
+  const [allFlights, setAllFlights] = useState<FlightItem[]>([]);
   const [isLoading, setIsLoading] = useState<boolean>(true);
   const [isRefreshing, setIsRefreshing] = useState<boolean>(false);
   const [error, setError] = useState<string | null>(null);
@@ -55,7 +57,7 @@ export function App() {
       });
   }, []);
 
-  // Fetch flights callback
+  // Fetch all flights for current airport & mode
   const fetchFlights = useCallback(
     async (isBackground = false) => {
       if (!isBackground) {
@@ -67,7 +69,7 @@ export function App() {
 
       try {
         const response = await fetch(
-          `/api/flights?airport=${selectedAirport}&mode=${mode}`
+          `/api/flights?airport=${selectedAirport}&mode=${mode}&timeframe=all`
         );
 
         if (!response.ok) {
@@ -76,7 +78,7 @@ export function App() {
         }
 
         const data: FlightItem[] = await response.json();
-        setFlights(data);
+        setAllFlights(data);
         setLastUpdated(new Date());
         setCountdown(REFRESH_INTERVAL);
       } catch (err: unknown) {
@@ -110,11 +112,29 @@ export function App() {
     return () => clearInterval(timer);
   }, [fetchFlights]);
 
+  // Split into upcoming and past
+  const upcomingFlights = useMemo(
+    () => allFlights.filter((f) => !f.is_past),
+    [allFlights]
+  );
+
+  const pastFlights = useMemo(
+    () => allFlights.filter((f) => Boolean(f.is_past)),
+    [allFlights]
+  );
+
+  // Active list based on chosen timeframe
+  const activeFlightsList = useMemo(() => {
+    if (timeframe === 'upcoming') return upcomingFlights;
+    if (timeframe === 'past') return pastFlights;
+    return allFlights;
+  }, [timeframe, upcomingFlights, pastFlights, allFlights]);
+
   // Filtered flights based on live search
   const filteredFlights = useMemo(() => {
-    if (!searchQuery.trim()) return flights;
+    if (!searchQuery.trim()) return activeFlightsList;
     const q = searchQuery.toLowerCase().trim();
-    return flights.filter(
+    return activeFlightsList.filter(
       (f) =>
         f.flight.toLowerCase().includes(q) ||
         f.city.toLowerCase().includes(q) ||
@@ -122,7 +142,7 @@ export function App() {
         f.resource.toLowerCase().includes(q) ||
         f.status.toLowerCase().includes(q)
     );
-  }, [flights, searchQuery]);
+  }, [activeFlightsList, searchQuery]);
 
   // Toggle fullscreen mode
   const toggleFullscreen = () => {
@@ -143,7 +163,7 @@ export function App() {
       <div className="fixed top-0 left-1/2 -translate-x-1/2 w-full max-w-7xl h-32 bg-gradient-to-b from-cyan-500/10 via-amber-500/5 to-transparent blur-3xl pointer-events-none"></div>
 
       {/* Main App Container */}
-      <div className="w-full max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-6 flex-1 flex flex-col space-y-6 relative z-10">
+      <div className="w-full max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-6 flex-1 flex flex-col space-y-5 relative z-10">
         
         {/* Header Bar */}
         <header className="flex flex-col md:flex-row md:items-center justify-between gap-4 pb-4 border-b border-fids-border/80">
@@ -183,40 +203,51 @@ export function App() {
           </div>
         </header>
 
-        {/* Controls Section: Airport Selector, Mode Switcher, Search, Auto-Refresh */}
-        <div className="flex flex-col gap-4">
-          <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-4">
-            {/* Airport Hubs */}
-            <AirportSelector
-              airports={airports}
-              selectedAirport={selectedAirport}
-              onSelectAirport={(code) => setSelectedAirport(code)}
-            />
+        {/* Controls Section: Airport Selector & Auto-Refresh */}
+        <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-4">
+          <AirportSelector
+            airports={airports}
+            selectedAirport={selectedAirport}
+            onSelectAirport={(code) => setSelectedAirport(code)}
+          />
 
-            {/* Auto Refresh Indicator */}
-            <AutoRefreshIndicator
-              countdown={countdown}
-              totalInterval={REFRESH_INTERVAL}
-              isRefreshing={isRefreshing}
-              onRefresh={() => fetchFlights(true)}
-              lastUpdated={lastUpdated}
-            />
-          </div>
+          <AutoRefreshIndicator
+            countdown={countdown}
+            totalInterval={REFRESH_INTERVAL}
+            isRefreshing={isRefreshing}
+            onRefresh={() => fetchFlights(true)}
+            lastUpdated={lastUpdated}
+          />
+        </div>
 
-          {/* Sub-bar: Mode Switcher + Live Search */}
-          <div className="flex flex-col sm:flex-row items-stretch sm:items-center justify-between gap-3 pt-1">
-            <ModeSelector
-              mode={mode}
-              onSelectMode={(m) => setMode(m)}
-              departuresCount={mode === 'departures' ? flights.length : undefined}
-              arrivalsCount={mode === 'arrivals' ? flights.length : undefined}
-            />
+        {/* Navigation Section: Mode Switcher (Departures vs Arrivals) + Timeline Switcher (Now/Upcoming vs Earlier) + Search */}
+        <div className="flex flex-col gap-3 p-2 bg-slate-950/40 border border-fids-border/70 rounded-2xl">
+          <div className="flex flex-col xl:flex-row xl:items-center justify-between gap-3">
+            {/* Mode & Timeline Switchers */}
+            <div className="flex flex-wrap items-center gap-3">
+              <ModeSelector
+                mode={mode}
+                onSelectMode={(m) => setMode(m)}
+                departuresCount={mode === 'departures' ? allFlights.length : undefined}
+                arrivalsCount={mode === 'arrivals' ? allFlights.length : undefined}
+              />
 
+              <TimelineSelector
+                timeframe={timeframe}
+                onSelectTimeframe={(tf) => setTimeframe(tf)}
+                mode={mode}
+                upcomingCount={upcomingFlights.length}
+                pastCount={pastFlights.length}
+                allCount={allFlights.length}
+              />
+            </div>
+
+            {/* Instant Search Bar */}
             <SearchBar
               value={searchQuery}
               onChange={setSearchQuery}
               resultCount={filteredFlights.length}
-              totalCount={flights.length}
+              totalCount={activeFlightsList.length}
             />
           </div>
         </div>
@@ -242,9 +273,11 @@ export function App() {
           <FidsTable
             flights={filteredFlights}
             mode={mode}
+            timeframe={timeframe}
             isLoading={isLoading}
             searchQuery={searchQuery}
             onClearSearch={() => setSearchQuery('')}
+            onSwitchTimeframe={(tf) => setTimeframe(tf)}
           />
         </main>
 
@@ -263,4 +296,3 @@ export function App() {
 }
 
 export default App;
-
