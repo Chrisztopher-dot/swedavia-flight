@@ -35,7 +35,7 @@ Vi analyserade två offentliga REST-API:er från Swedavia (`api.swedavia.se`):
 ```python
 def get_flight_board(airport, mode, date):
     headers = {"Ocp-Apim-Subscription-Key": KEY, "Accept": "application/json"}
-    raw_data = http_get(f"[https://api.swedavia.se/flightinfo/v2/](https://api.swedavia.se/flightinfo/v2/){airport}/{mode}/{date}", headers=headers)
+    raw_data = http_get(f"https://api.swedavia.se/flightinfo/v2/{airport}/{mode}/{date}", headers=headers)
     
     clean_flights = []
     for flight in raw_data["flights"]:
@@ -49,3 +49,30 @@ def get_flight_board(airport, mode, date):
             "status": flight["flightLegStatusSwedish"]
         })
     return sort_chronologically(clean_flights)
+```
+
+---
+
+## 🚀 Running the Web FIDS Application
+
+### 1. Start the FastAPI Backend
+```bash
+# In the project root
+./.venv/bin/uvicorn server:app --host 0.0.0.0 --port 8000 --reload
+```
+API Documentation is available at `http://localhost:8000/docs`.
+
+### 2. Start the Modern Frontend (Development Mode)
+```bash
+# In another terminal window
+cd frontend
+npm run dev
+```
+Open `http://localhost:5173` in your browser.
+
+### 3. All-in-One Production Mode
+You can also build the frontend and serve it directly from FastAPI at `http://localhost:8000`:
+```bash
+npm run build --prefix frontend
+./.venv/bin/python3 server.py
+```
